@@ -25,22 +25,23 @@ Quit: `killall AltTab`.
 | Option+Esc        | cancel                                              |
 | release Option    | switch to selection                                 |
 
+The selected tile shows a close button (closes that window) and a quit button (quits its app). Hover to select, click a tile to switch to it, click anywhere else to cancel.
+
 ## Keeping the permission across rebuilds
 
 macOS ties the Accessibility grant to the code signature. The default ad-hoc signature changes every build, so the grant is lost. Fix it once with a self-signed certificate:
 
 1. Create the identity from the CLI (Keychain Access's Certificate Assistant may not be available):
    ```sh
-   printf '[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=AltTab Local\n[ext]\nbasicConstraints=critical,CA:false\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\n' > /tmp/c.cnf
-   /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config /tmp/c.cnf -keyout /tmp/k.pem -out /tmp/c.pem
-   /usr/bin/openssl pkcs12 -export -inkey /tmp/k.pem -in /tmp/c.pem -out /tmp/id.p12 -passout pass:x
-   security import /tmp/id.p12 -k ~/Library/Keychains/login.keychain-db -P x -T /usr/bin/codesign
-   rm /tmp/c.cnf /tmp/k.pem /tmp/c.pem /tmp/id.p12
+   d=$(mktemp -d) && chmod 700 "$d"
+   printf '[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=AltTab Local\n[ext]\nbasicConstraints=critical,CA:false\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\n' > "$d/c.cnf"
+   /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config "$d/c.cnf" -keyout "$d/k.pem" -out "$d/c.pem"
+   /usr/bin/openssl pkcs12 -export -inkey "$d/k.pem" -in "$d/c.pem" -out "$d/id.p12" -passout pass:x
+   security import "$d/id.p12" -k ~/Library/Keychains/login.keychain-db -P x -T /usr/bin/codesign
+   rm -rf "$d"
    ```
    `security find-identity -p codesigning` shows it as `CSSMERR_TP_NOT_TRUSTED`; that is fine for local signing.
-2. `make` (the Makefile signs with `AltTab Local` by default; override with `make SIGN_ID="..."`, or `SIGN_ID=-` for ad-hoc). On the first build, approve codesign's keychain prompt with Always Allow.
+2. `make` (the Makefile signs with `AltTab Local` by default; override with `make SIGN_ID="..."`, or `SIGN_ID=-` for ad-hoc). When codesign asks for keychain access, choose Allow, not Always Allow: Always Allow lets any process you run sign as `AltTab Local` and inherit this app's Accessibility and Screen Recording grants.
 3. Re-grant Accessibility and Screen Recording once. Later rebuilds keep them.
 
 If the permission gets stuck, `make reset` clears it.
-
-Set `ALTTAB_DEBUG=1` and run `AltTab.app/Contents/MacOS/AltTab` to log enumeration timings.

@@ -10,7 +10,7 @@ $(BIN): main.swift Info.plist
 	cp Info.plist $(APP)/Contents/
 	swiftc -O -wmo -swift-version 5 -o $@ main.swift
 	strip -x $@
-	codesign --force -s "$(SIGN_ID)" $(APP)
+	codesign --force --options runtime -s "$(SIGN_ID)" $(APP)
 
 run: all
 	-killall AltTab 2>/dev/null

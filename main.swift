@@ -6,8 +6,6 @@ import ScreenCaptureKit
 @_silgen_name("_AXUIElementGetWindow") @discardableResult
 func _AXUIElementGetWindow(_ el: AXUIElement, _ wid: inout CGWindowID) -> AXError
 
-let debug = ProcessInfo.processInfo.environment["ALTTAB_DEBUG"] != nil
-
 struct Win {
     let ax: AXUIElement
     let id: CGWindowID
@@ -121,9 +119,27 @@ final class Grid: NSView {
         return c < cols && i < wins.count ? i : nil
     }
 
-    // Hover selects, click switches.
+    // Close and quit buttons at the right end of the selected tile's title row, below the preview.
+    func buttons(_ i: Int) -> (close: NSRect, quit: NSRect) {
+        let f = tileRect(i), s: CGFloat = 18, y = f.minY + Grid.ph * scale + 13
+        return (NSRect(x: f.maxX - 12 - 2 * s, y: y, width: s, height: s), NSRect(x: f.maxX - 8 - s, y: y, width: s, height: s))
+    }
+
+    static func symbol(_ name: String, _ label: String, _ color: NSColor) -> NSImage? {
+        NSImage(systemSymbolName: name, accessibilityDescription: label)?.withSymbolConfiguration(
+            NSImage.SymbolConfiguration(pointSize: 18, weight: .regular).applying(.init(paletteColors: [.white, color])))
+    }
+    static let closeIcon = symbol("xmark.circle.fill", "Close window", .systemRed)
+    static let quitIcon = symbol("power.circle.fill", "Quit app", .systemOrange)
+
+    // Hover selects, click switches (or closes/quits via the buttons), click between tiles cancels.
     override func mouseMoved(with e: NSEvent) { if let i = index(e), i != sel { switcher.select(i) } }
-    override func mouseDown(with e: NSEvent) { if let i = index(e) { switcher.select(i); switcher.finish() } }
+    override func mouseDown(with e: NSEvent) {
+        guard let i = index(e) else { switcher.stop(); return }
+        // Buttons are only drawn on the selected tile, so only it can hit them.
+        let p = convert(e.locationInWindow, from: nil), b = buttons(i)
+        if i == sel && b.close.contains(p) { switcher.close(i) } else if i == sel && b.quit.contains(p) { switcher.quit(i) } else { switcher.select(i); switcher.finish() }
+    }
 
     static let attrs: [NSAttributedString.Key: Any] = {
         let p = NSMutableParagraphStyle()
@@ -166,26 +182,27 @@ final class Grid: NSView {
             let ty = area.maxY + 6
             icon.draw(in: NSRect(x: f.minX + 8, y: ty, width: 16, height: 16), from: .zero, operation: .sourceOver,
                       fraction: 1, respectFlipped: true, hints: nil)
-            (w.title as NSString).draw(in: NSRect(x: f.minX + 28, y: ty + 1, width: f.width - 36, height: 16), withAttributes: Grid.attrs)
+            // The selected tile's title makes room for the buttons.
+            let titleW = f.width - (i == sel ? 80 : 36)
+            (w.title as NSString).draw(in: NSRect(x: f.minX + 28, y: ty + 1, width: titleW, height: 16), withAttributes: Grid.attrs)
+            if i == sel {
+                let b = buttons(i)
+                Grid.closeIcon?.draw(in: b.close, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+                Grid.quitIcon?.draw(in: b.quit, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            }
         }
     }
-}
-
-final class Panel: NSPanel {
-    override var canBecomeKey: Bool { false }
 }
 
 // MARK: - Switcher
 
 final class Switcher {
-    let panel = Panel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+    let panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
     let grid = Grid()
-    var wins: [Win] = []
-    var sel = 0
     var active = false
     var timer: Timer?
     var showWork: DispatchWorkItem?
-    var tempKeys: [EventHotKeyRef?] = []
+    var tempKeys: [EventHotKeyRef] = []
 
     init() {
         panel.level = .popUpMenu
@@ -224,17 +241,21 @@ final class Switcher {
 
     func start(_ d: Int) {
         guard AXIsProcessTrusted() else { promptAccessibility(); return }
-        let t0 = CFAbsoluteTimeGetCurrent()
-        wins = listWindows()
-        if debug { NSLog("listed %d windows in %.1fms", wins.count, (CFAbsoluteTimeGetCurrent() - t0) * 1000) }
+        let wins = listWindows()
         guard !wins.isEmpty else { return }
         active = true
-        sel = wins.count == 1 ? 0 : d > 0 ? 1 : wins.count - 1
+        grid.wins = wins
+        // Skip the current window only if it is in the list (the frontmost app may have no standard window).
+        let skip = wins.count > 1 && wins[0].app.processIdentifier == NSWorkspace.shared.frontmostApplication?.processIdentifier ? 1 : 0
+        grid.sel = d > 0 ? skip : wins.count - 1
         tempKeys = [register(kVK_Escape, optionKey, 3), register(kVK_LeftArrow, optionKey, 4), register(kVK_RightArrow, optionKey, 5),
-                    register(kVK_UpArrow, optionKey, 6), register(kVK_DownArrow, optionKey, 7)]
+                    register(kVK_UpArrow, optionKey, 6), register(kVK_DownArrow, optionKey, 7)].compactMap { $0 }
         let t = Timer(timeInterval: 0.01, repeats: true) { [unowned self] _ in if !optionDown() { self.finish() } }
         RunLoop.main.add(t, forMode: .common)
         timer = t
+        makeClickTap()
+        swallowUp = false
+        if let clickTap { CGEvent.tapEnable(tap: clickTap, enable: true) }
         // Quick taps switch without ever showing the panel.
         let w = DispatchWorkItem { [unowned self] in self.show() }
         showWork = w
@@ -242,15 +263,10 @@ final class Switcher {
     }
 
     func show() {
-        let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!
-        let vf = screen.visibleFrame
-        grid.wins = wins
-        grid.sel = sel
+        let wins = grid.wins
         let ids = Set(wins.map(\.id))
         grid.previews = grid.previews.filter { ids.contains($0.key) }
-        let size = grid.layout(wins.count, vf.width * 0.9, vf.height * 0.9)
-        panel.setFrame(NSRect(x: vf.midX - size.width / 2, y: vf.midY - size.height / 2, width: size.width, height: size.height), display: false)
-        grid.needsDisplay = true
+        relayout()
         panel.orderFrontRegardless()
         // Minimized and hidden windows can't be captured; they keep their last preview.
         capture(Set(wins.filter { !$0.minimized && !$0.app.isHidden }.map(\.id))) { [unowned self] id, img in
@@ -259,24 +275,59 @@ final class Switcher {
         }
     }
 
-    func move(_ d: Int) { select((sel + d + wins.count) % wins.count) }
+    func relayout() {
+        let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!
+        let vf = screen.visibleFrame
+        let size = grid.layout(grid.wins.count, vf.width * 0.9, vf.height * 0.9)
+        panel.setFrame(NSRect(x: vf.midX - size.width / 2, y: vf.midY - size.height / 2, width: size.width, height: size.height), display: false)
+        grid.needsDisplay = true
+    }
+
+    // Unsaved changes may make the window or app refuse; it reappears next time.
+    func close(_ i: Int) {
+        let w = grid.wins[i]
+        if let b: AXUIElement = attr(w.ax, kAXCloseButtonAttribute) { AXUIElementPerformAction(b, kAXPressAction as CFString) }
+        remove { $0.id == w.id }
+    }
+
+    func quit(_ i: Int) {
+        let app = grid.wins[i].app
+        app.terminate()
+        remove { $0.app == app }
+    }
+
+    // Selection follows its window, or the next one if it was removed.
+    func remove(_ gone: (Win) -> Bool) {
+        let kept = grid.wins.prefix(grid.sel).filter { !gone($0) }.count
+        grid.wins.removeAll(where: gone)
+        guard !grid.wins.isEmpty else { stop(); return }
+        grid.sel = min(kept, grid.wins.count - 1)
+        relayout()
+    }
+
+    // Hotkey and mouse events can arrive after stop() has emptied the list.
+    func move(_ d: Int) {
+        guard active else { return }
+        let n = grid.wins.count
+        select((grid.sel + d + n) % n)
+    }
 
     // Up/down by one row, wrapping to the other end of the same column.
     func moveRow(_ d: Int) {
-        let c = grid.cols, col = sel % c, s = sel + d * c
-        select(s >= wins.count ? col : s < 0 ? col + (wins.count - 1 - col) / c * c : s)
+        let n = grid.wins.count, c = grid.cols, col = grid.sel % c, s = grid.sel + d * c
+        select(s >= n ? col : s < 0 ? col + (n - 1 - col) / c * c : s)
     }
 
     func select(_ i: Int) {
         guard active else { return }
-        grid.setNeedsDisplay(grid.tileRect(sel))
-        sel = i
+        grid.setNeedsDisplay(grid.tileRect(grid.sel))
         grid.sel = i
         grid.setNeedsDisplay(grid.tileRect(i))
     }
 
     func finish() {
-        let w = wins[sel]
+        guard active else { return }
+        let w = grid.wins[grid.sel]
         stop()
         focus(w)
     }
@@ -285,9 +336,11 @@ final class Switcher {
         timer?.invalidate(); timer = nil
         showWork?.cancel(); showWork = nil
         panel.orderOut(nil)
-        tempKeys.forEach { if let k = $0 { UnregisterEventHotKey(k) } }
+        // Keep the tap until the swallowed click's mouse-up has been eaten too.
+        if let clickTap, !swallowUp { CGEvent.tapEnable(tap: clickTap, enable: false) }
+        tempKeys.forEach { UnregisterEventHotKey($0) }
         tempKeys = []
-        wins = []; grid.wins = []
+        grid.wins = []
         active = false
     }
 }
@@ -307,6 +360,44 @@ func promptAccessibility() {
 
 let app = NSApplication.shared
 let switcher = Switcher()
+
+// A click outside the open switcher cancels it and is swallowed: with Option held it would otherwise
+// reach the clicked app as an Option-click, which hides apps. Enabled only while the switcher is open.
+var swallowUp = false
+var clickTap: CFMachPort?
+
+// Creating the tap needs Accessibility, so start() retries until it has been granted.
+func makeClickTap() {
+    guard clickTap == nil else { return }
+    clickTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+        eventsOfInterest: [CGEventType.leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp].reduce(0) { $0 | 1 << $1.rawValue },
+        callback: { _, type, event, _ in
+            switch type {
+            case .tapDisabledByTimeout, .tapDisabledByUserInput:
+                if switcher.active, let clickTap { CGEvent.tapEnable(tap: clickTap, enable: true) }
+            case .leftMouseDown, .rightMouseDown:
+                let p = switcher.panel
+                if switcher.active && !(p.isVisible && NSMouseInRect(NSEvent.mouseLocation, p.frame, false)) {
+                    swallowUp = true
+                    switcher.stop()
+                    return nil
+                }
+            case .leftMouseUp, .rightMouseUp:
+                if swallowUp {
+                    swallowUp = false
+                    if !switcher.active, let clickTap { CGEvent.tapEnable(tap: clickTap, enable: false) }
+                    return nil
+                }
+            default: break
+            }
+            return Unmanaged.passUnretained(event)
+        }, userInfo: nil)
+    if let clickTap {
+        CGEvent.tapEnable(tap: clickTap, enable: false)
+        CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, clickTap, 0), .commonModes)
+    }
+}
+makeClickTap()
 
 var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
 InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
