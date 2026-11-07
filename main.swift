@@ -56,15 +56,92 @@ func listWindows() -> [Win] {
         }
         lock.lock(); perApp[i] = out; lock.unlock()
     }
-    return perApp.joined().sorted { $0.z < $1.z }
+    // Recently focused windows first; the rest keep their z-order behind them.
+    let rank = Dictionary(mru.enumerated().map { ($1, $0) }, uniquingKeysWith: min)
+    func key(_ w: Win) -> Int { rank[w.id] ?? mru.count + w.z }
+    return perApp.joined().sorted { key($0) < key($1) }
+}
+
+// MARK: - Recency
+
+// Most recently focused window ids, newest first. The z-order alone can't give this order:
+// activating an app raises all of its windows, so it groups them by app.
+var mru: [CGWindowID] = []
+var observers: [pid_t: AXObserver] = [:]
+
+// Saved so a restart (e.g. a rebuild) keeps the order; window ids outlive our process.
+func touch(_ id: CGWindowID) {
+    guard id != 0 else { return }
+    mru.removeAll { $0 == id }
+    mru.insert(id, at: 0)
+    if mru.count > 500 { mru.removeLast(mru.count - 500) }
+    UserDefaults.standard.set(mru, forKey: "mru")
+}
+
+func touch(_ w: AXUIElement) {
+    var id: CGWindowID = 0
+    _AXUIElementGetWindow(w, &id)
+    touch(id)
+}
+
+// Watches an app's focused window. Fails while the app is still launching; later calls retry.
+func observe(_ app: NSRunningApplication) {
+    let pid = app.processIdentifier
+    guard app.activationPolicy == .regular, pid != getpid(), observers[pid] == nil else { return }
+    var obs: AXObserver?
+    guard AXObserverCreate(pid, { _, el, _, _ in touch(el) }, &obs) == .success, let obs,
+          AXObserverAddNotification(obs, AXUIElementCreateApplication(pid), kAXFocusedWindowChangedNotification as CFString, nil) == .success
+    else { return }
+    CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .commonModes)
+    observers[pid] = obs
+}
+
+// Needs Accessibility, so it runs at launch and again on every switch until granted.
+func trackRecency() {
+    guard AXIsProcessTrusted() else { return }
+    // Without history, z-order is the best guess, but it is grouped by app; saved history comes first.
+    if mru.isEmpty {
+        let saved = UserDefaults.standard.array(forKey: "mru") as? [CGWindowID] ?? []
+        let known = Set(saved)
+        mru = saved + listWindows().map(\.id).filter { $0 != 0 && !known.contains($0) }
+    }
+    NSWorkspace.shared.runningApplications.forEach(observe)
+}
+
+// Private SkyLight calls, as used by alt-tab-macos and yabai. The public ways to activate an app
+// (kAXFrontmostAttribute, NSRunningApplication.activate) raise all of its windows; these raise one.
+@_silgen_name("GetProcessForPID") @discardableResult
+func GetProcessForPID(_ pid: pid_t, _ psn: UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
+@_silgen_name("_SLPSSetFrontProcessWithOptions") @discardableResult
+func _SLPSSetFrontProcessWithOptions(_ psn: UnsafeMutablePointer<ProcessSerialNumber>, _ wid: CGWindowID, _ mode: UInt32) -> CGError
+@_silgen_name("SLPSPostEventRecordTo") @discardableResult
+func SLPSPostEventRecordTo(_ psn: UnsafeMutablePointer<ProcessSerialNumber>, _ bytes: UnsafeMutablePointer<UInt8>) -> CGError
+
+// Makes the window key with a synthetic mouse-down addressed to it by id. The click point is far
+// outside any window so no content is hit (layout from alt-tab-macos's makeKeyWindow).
+func makeKey(_ psn: inout ProcessSerialNumber, _ wid: CGWindowID) {
+    var wid = wid, point = CGPoint(x: 300_000, y: 300_000)
+    var bytes = [UInt8](repeating: 0, count: 0x100)  // record is 0xf8; WindowServer reads past it
+    bytes[0x04] = 0xf8
+    bytes[0x08] = 0x01  // left mouse down
+    bytes[0x3a] = 0x10
+    memcpy(&bytes[0x20], &point, MemoryLayout<CGPoint>.size)
+    memcpy(&bytes[0x3c], &wid, MemoryLayout<CGWindowID>.size)
+    SLPSPostEventRecordTo(&psn, &bytes)
 }
 
 func focus(_ w: Win) {
     if w.app.isHidden { w.app.unhide() }
     if w.minimized { AXUIElementSetAttributeValue(w.ax, kAXMinimizedAttribute as CFString, kCFBooleanFalse) }
-    AXUIElementSetAttributeValue(AXUIElementCreateApplication(w.app.processIdentifier), kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+    if w.id != 0 {
+        var psn = ProcessSerialNumber()
+        GetProcessForPID(w.app.processIdentifier, &psn)
+        _SLPSSetFrontProcessWithOptions(&psn, w.id, 0x200)  // user generated; this window only
+        makeKey(&psn, w.id)
+    } else {
+        AXUIElementSetAttributeValue(AXUIElementCreateApplication(w.app.processIdentifier), kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+    }
     AXUIElementPerformAction(w.ax, kAXRaiseAction as CFString)
-    AXUIElementSetAttributeValue(w.ax, kAXMainAttribute as CFString, kCFBooleanTrue)
 }
 
 // Window previews need Screen Recording; without it tiles show app icons only.
@@ -241,6 +318,7 @@ final class Switcher {
 
     func start(_ d: Int) {
         guard AXIsProcessTrusted() else { promptAccessibility(); return }
+        trackRecency()
         let wins = listWindows()
         guard !wins.isEmpty else { return }
         active = true
@@ -330,6 +408,7 @@ final class Switcher {
         let w = grid.wins[grid.sel]
         stop()
         focus(w)
+        touch(w.id)
     }
 
     func stop() {
@@ -413,6 +492,19 @@ _ = register(kVK_Tab, optionKey | shiftKey, 2)
 // A hung app must not stall the switcher.
 AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.1)
 if !AXIsProcessTrusted() { promptAccessibility() }
+
+// Focus changes within an app come from its observer; switching apps (Cmd+Tab, Dock, clicks) from here.
+let ws = NSWorkspace.shared.notificationCenter
+ws.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { n in
+    guard let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+    if let w: AXUIElement = attr(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute) { touch(w) }
+    observe(app)
+}
+ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { n in
+    guard let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+    observers[app.processIdentifier] = nil
+}
+trackRecency()
 if !CGPreflightScreenCaptureAccess() { CGRequestScreenCaptureAccess() }
 
 app.run()
